@@ -69,7 +69,34 @@ impl<'a> Iterator for SratEntryIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         while self.remaining_length > 0 {
             let entry_pointer = self.pointer;
+
+            if (self.remaining_length as usize) < mem::size_of::<EntryHeader>() {
+                warn!("Trailing bytes in SRAT too short for an entry header. Ignoring");
+                return None;
+            }
             let header = unsafe { *(self.pointer as *const EntryHeader) };
+
+            /*
+             * An entry is read by casting its bytes to the structure its type names, so one
+             * shorter than that structure would be read past its own end. A length below the
+             * header's also never advances the iterator.
+             */
+            let minimum_length = match header.typ {
+                0 => mem::size_of::<LocalApicAffinity>(),
+                1 => mem::size_of::<MemoryAffinity>(),
+                2 => mem::size_of::<LocalApicX2Affinity>(),
+                3 => mem::size_of::<GiccAffinity>(),
+                4 => mem::size_of::<GicItsAffinity>(),
+                5 => mem::size_of::<GicInitiatorAffinity>(),
+                _ => mem::size_of::<EntryHeader>(),
+            };
+            if (header.length as usize) < minimum_length {
+                warn!(
+                    "Invalid entry of type {} in SRAT - length {} is shorter than the {} bytes of its structure. Ignoring",
+                    header.typ, header.length, minimum_length
+                );
+                return None;
+            }
 
             if header.length as u32 > self.remaining_length {
                 warn!("Invalid entry of type {} in SRAT - extending past length of table. Ignoring", header.typ);
@@ -242,6 +269,7 @@ pub struct GicInitiatorAffinity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::{vec, vec::Vec};
 
     /// An SRAT with one processor entry and one memory entry above 4GiB, laid out byte by byte
     /// as the specification gives it.
@@ -291,5 +319,50 @@ mod tests {
         assert!({ memory.flags }.contains(MemoryAffinityFlags::ENABLED));
 
         assert!(entries.next().is_none());
+    }
+
+    /// An SRAT whose entries are exactly `entries`, after the 48-byte fixed part.
+    fn table_of(entries: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0u8; 48];
+        bytes[0..4].copy_from_slice(b"SRAT");
+        bytes[4..8].copy_from_slice(&(48u32 + entries.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(entries);
+        bytes
+    }
+
+    fn entry_count(bytes: &[u8]) -> usize {
+        let srat = unsafe { Pin::new_unchecked(&*(bytes.as_ptr() as *const Srat)) };
+        srat.entries().count()
+    }
+
+    #[test]
+    fn an_entry_of_length_zero_ends_the_walk() {
+        // A zero length never advances the iterator, whether the type is known or not.
+        for typ in [0u8, 1, 5, 6, 0xff] {
+            let mut entries = vec![typ, 0, 0, 0];
+            entries.extend_from_slice(&table()[48..64]);
+            assert_eq!(entry_count(&table_of(&entries)), 0);
+        }
+    }
+
+    #[test]
+    fn an_entry_shorter_than_its_structure_ends_the_walk() {
+        // A memory affinity structure is 40 bytes; this one states 4 and ends the table.
+        assert_eq!(entry_count(&table_of(&[1, 4, 0, 0])), 0);
+
+        // A valid entry before it is still yielded.
+        let mut entries = table()[48..64].to_vec();
+        entries.extend_from_slice(&[1, 4, 0, 0]);
+        assert_eq!(entry_count(&table_of(&entries)), 1);
+    }
+
+    #[test]
+    fn trailing_bytes_shorter_than_a_header_end_the_walk() {
+        assert_eq!(entry_count(&table_of(&[0xff])), 0);
+    }
+
+    #[test]
+    fn an_unknown_entry_with_only_a_header_is_skipped() {
+        assert_eq!(entry_count(&table_of(&[0xff, 2])), 0);
     }
 }
