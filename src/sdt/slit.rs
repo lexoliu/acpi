@@ -31,15 +31,19 @@ impl Slit {
     }
 
     pub fn matrix_raw(self: Pin<&Self>) -> &[u8] {
-        let mut num_entries = self.num_proximity_domains * self.num_proximity_domains;
-        if (mem::size_of::<Slit>() + num_entries as usize * mem::size_of::<u8>()) > self.header.length as usize {
-            warn!("SLIT too short for given number of proximity domains! Returning empty matrix");
-            num_entries = 0;
-        }
+        let available = (self.header.length as usize).saturating_sub(mem::size_of::<Slit>());
+        let num_proximity_domains = self.num_proximity_domains;
+        let num_entries = match num_proximity_domains.checked_mul(num_proximity_domains) {
+            Some(num_entries) if num_entries <= available as u64 => num_entries as usize,
+            _ => {
+                warn!("SLIT too short for given number of proximity domains! Returning empty matrix");
+                0
+            }
+        };
 
         unsafe {
             let ptr = Pin::into_inner_unchecked(self) as *const Slit as *const u8;
-            slice::from_raw_parts(ptr.byte_add(mem::size_of::<Slit>()), num_entries as usize)
+            slice::from_raw_parts(ptr.byte_add(mem::size_of::<Slit>()), num_entries)
         }
     }
 }
@@ -52,7 +56,9 @@ pub struct DistanceMatrix<'a> {
 impl DistanceMatrix<'_> {
     pub fn distance(&self, i: u32, j: u32) -> Option<u8> {
         if (i as u64) < self.num_proximity_domains && (j as u64) < self.num_proximity_domains {
-            Some(self.matrix[i as usize * self.num_proximity_domains as usize + j as usize])
+            // The matrix is empty when the table refused its own count, so the cell may be absent.
+            let index = (i as u64).checked_mul(self.num_proximity_domains)?.checked_add(j as u64)?;
+            self.matrix.get(usize::try_from(index).ok()?).copied()
         } else {
             None
         }
@@ -78,6 +84,17 @@ mod tests {
         let bytes = table();
         let slit = unsafe { Pin::new_unchecked(&*(bytes.as_ptr() as *const Slit)) };
         assert_eq!(slit.matrix_raw(), &[10, 20, 21, 10]);
+    }
+
+    #[test]
+    fn a_count_whose_square_overflows_or_exceeds_the_table_has_no_matrix() {
+        for count in [1u64 << 32, u64::MAX, 3] {
+            let mut bytes = table();
+            bytes[36..44].copy_from_slice(&count.to_le_bytes());
+            let slit = unsafe { Pin::new_unchecked(&*(bytes.as_ptr() as *const Slit)) };
+            assert!(slit.matrix_raw().is_empty());
+            assert_eq!(slit.matrix().distance(0, 0), None);
+        }
     }
 
     #[test]
